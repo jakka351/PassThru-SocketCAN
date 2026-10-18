@@ -1,0 +1,14 @@
+# C# build output
+[Bb]in/
+[Oo]bj/
+
+# C / native DLL build intermediates
+*.obj
+*.exp
+*.ilk
+*.pdb
+*.lib
+
+# Keep source. The built TesPassThruSocketCAN.dll may be committed for a release,
+# or uncomment the next line to keep it out of git:
+# dll/*.dll
