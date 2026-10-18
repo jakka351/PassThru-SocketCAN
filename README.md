@@ -16,6 +16,7 @@ an ordinary PassThru device and talks to the vehicle over Wi-Fi or Ethernet.
    • socketcand raw-mode client
    • config from the registry
 ```
+<img width="4080" height="2296" alt="image" src="https://github.com/user-attachments/assets/f3ac6c63-a2eb-4d81-9087-1eb9281676d2" />
 
 It reuses the proven J2534 export skeleton from the Tester Engineering emulator stub and speaks the
 **exact same socketcand protocol** as TES's own SocketCAN transport, so the Pi you built with the
@@ -38,6 +39,7 @@ PassThru-SocketCAN/
 │   └── logo.png                    ← Tester Present logo (embedded as a resource)
 └── README.md
 ```
+<img width="4080" height="2296" alt="image" src="https://github.com/user-attachments/assets/f5ec269b-d89f-4390-b4c0-f25ac5508af5" />
 
 ---
 
