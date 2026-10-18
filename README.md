@@ -4,11 +4,11 @@
 
 A **SAE J2534 PassThru adapter that is actually a networked SocketCAN bus.** Point it at a Raspberry
 Pi running [socketcand](https://github.com/jakka351/Tester-Engineering-DIY) and *any* Windows J2534
-application — Tester Engineering Suite, ForScan, Ford/Mazda IDS, HP Tuners, PCMFlash, … — sees it as
+application — Tester Engineering Suite, ForScan, Ford FJDS, PCMTEC, PCMFlash, … — sees it as
 an ordinary PassThru device and talks to the vehicle over Wi-Fi or Ethernet.
 
 ```
- J2534 app (TES / ForScan / IDS / HP Tuners …)
+ J2534 app (any J2534 software …)
    │  loads TesPassThruSocketCAN.dll  (native, stdcall J2534 04.04)
    ▼
  TesPassThruSocketCAN.dll  ── TCP 29536 ──►  Raspberry Pi
