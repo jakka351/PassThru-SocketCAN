@@ -15,4 +15,9 @@
     <ImplicitUsings>disable</ImplicitUsings>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Tester Present logo, loaded at runtime from the embedded resource. -->
+    <EmbeddedResource Include="logo.png" />
+  </ItemGroup>
+
 </Project>

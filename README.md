@@ -33,8 +33,9 @@ PassThru-SocketCAN/
 │   └── build.bat                   ← cl /LD build (x86)
 ├── config-app/
 │   ├── TesSocketCANConfig.csproj   ← .NET 4.8.1 WinForms setup app (SDK-style)
-│   ├── Program.cs                  ← form: host/port/iface/bitrate/listen, Test, Register/Unregister
-│   └── app.manifest                ← requireAdministrator (writes HKLM)
+│   ├── Program.cs                  ← the whole app: form, socketcand test, registry, GDI+ flag
+│   ├── app.manifest                ← requireAdministrator (writes HKLM)
+│   └── logo.png                    ← Tester Present logo (embedded as a resource)
 └── README.md
 ```
 
@@ -67,17 +68,81 @@ Produces `config-app\bin\Release\net481\TesSocketCANConfig.exe`. (Or `dotnet bui
 
 > Tip: put `TesPassThruSocketCAN.dll` next to `TesSocketCANConfig.exe` and the app auto-fills the DLL path.
 
-## 3. Install / register
+## 3. The configuration application (`TesSocketCANConfig.exe`)
 
-1. Run **`TesSocketCANConfig.exe`** (it elevates — it writes `HKLM`).
-2. Enter the **Pi host/IP** (e.g. `10.42.0.1` for the Wi-Fi AP, or your Ethernet IP), **port** `29536`,
-   **interface** `can0`, and the **CAN bus speed** (500 k for OBD-II).
-3. Click **Test Connection** — it does the real socketcand handshake (`open can0` → `rawmode`) and
-   confirms the Pi is reachable.
-4. Click **Register Device**. `Tester Present SocketCAN` is now a J2534 device.
+A small .NET 4.8.1 WinForms app that is the **only setup you need**: it points the DLL at your Pi,
+proves the link works, and registers the adapter so every J2534 app can see it. It is the program
+named in the registry as the device's `ConfigApplication`, so a J2534 app's *"Configure device"*
+button opens it too.
 
-Any J2534 application will list **"Tester Present SocketCAN"** in its device/adapter picker. Select
-it and connect as you would any PassThru interface.
+![The SocketCAN PassThru configuration application](docs/config-app.png)
+
+### Window layout
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Tester Present Specialist Automotive Solutions          [ LOGO ]      │  ← header band
+│  SocketCAN PassThru Config Application                                 │
+├──────────────────────────────────────────────────────────────────────┤
+│  Raspberry Pi host / IP : [ 10.42.0.1                              ]   │
+│  socketcand TCP port    : [ 29536  ]                                   │
+│  SocketCAN interface    : [ can0   ]                                   │
+│  CAN bus speed (bit/s)  : [ 500000  (HS-CAN / OBD-II)        ▾ ]        │
+│                           [ ] Listen-only (never transmit / ACK)       │
+│  J2534 DLL path         : [ …\TesPassThruSocketCAN.dll ] [ Browse… ]    │
+│                                                                        │
+│  [ Test Connection ] [ Save Config ] [ Register Device ] [ Unregister ]│
+│  ┌──────────────────────── activity log ───────────────────────────┐  │
+│  │ Loaded. Fill in the Pi details, Test Connection, then Register…  │  │
+│  └──────────────────────────────────────────────────────────────────┘ │
+├──────────────────────────────────────────────────────────────────────┤
+│ 🇦🇺 Made in Australia        Tester Present Specialist Automotive Sol…  │  ← status bar
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+- **Header band** — the Tester Present branding: the title *"Tester Present Specialist Automotive
+  Solutions"*, the subtitle *"SocketCAN PassThru Config Application"*, and the logo pinned top-right.
+- **Status bar** — carries a small **Australian flag drawn entirely in GDI+ at runtime** (no image
+  asset): navy field, Union Jack canton, the Commonwealth star and the Southern Cross, rendered by
+  `CreateAustralianFlag()` in `Program.cs`.
+
+### Fields
+
+| Field | What it is | Typical value |
+|-------|------------|---------------|
+| **Raspberry Pi host / IP** | Where socketcand is running | `10.42.0.1` (Wi-Fi AP) or your Ethernet IP |
+| **socketcand TCP port** | The daemon's port | `29536` (TES default) |
+| **SocketCAN interface** | The CAN interface on the Pi | `can0` |
+| **CAN bus speed** | Informational / stored for the DLL | `500000` HS-CAN/OBD-II · `250000` J1939 · `125000` MS-CAN · `1000000` |
+| **Listen-only** | Passive monitoring — never transmit or ACK | off for diagnostics |
+| **J2534 DLL path** | The `TesPassThruSocketCAN.dll` to register | auto-filled if the DLL sits next to the exe |
+
+> The *bus speed* is applied on the **Pi** (`can0` bitrate) — this field is stored so the DLL and any
+> tooling know the configured rate; it does not re-bitrate the Pi for you.
+
+### Buttons
+
+| Button | Does |
+|--------|------|
+| **Test Connection** | Opens a TCP socket to the Pi and runs the real socketcand handshake (`< open can0 >` → `< rawmode >`). Tells you immediately if the Pi is unreachable, the interface name is wrong, or raw mode was refused — before you ever launch a diagnostic app. |
+| **Save Config** | Writes the Host/Port/Interface/Bitrate/ListenOnly values to the DLL's config key (the DLL reads these on `PassThruOpen`). |
+| **Register Device** | Saves the config **and** writes the J2534 registration, so `Tester Present SocketCAN` appears in every J2534 app's adapter list. |
+| **Unregister** | Removes the J2534 registration (the DLL/config stay on disk). |
+| **Browse…** | Pick the DLL if it isn't next to the exe. |
+
+The **activity log** at the bottom records every action and the result of a connection test.
+
+### First-time setup
+
+1. Build or download the two files; put `TesPassThruSocketCAN.dll` next to `TesSocketCANConfig.exe`.
+2. Run **`TesSocketCANConfig.exe`** — it elevates automatically (it writes `HKLM`; accept the UAC prompt).
+3. Enter the **Pi host/IP**, **port** `29536`, **interface** `can0`, and the **CAN bus speed** (500 k for OBD-II).
+4. Click **Test Connection** and confirm *"SUCCESS – socketcand reachable…"* in the log.
+5. Click **Register Device**.
+
+Any J2534 application now lists **"Tester Present SocketCAN"** in its device/adapter picker. Select it
+and connect as you would any PassThru interface. To change the Pi details later, reopen the app, edit,
+and **Save Config** (no need to re-register).
 
 > **In TES specifically** you don't need this shim — TES has a native SocketCAN transport. This DLL
 > is for every *other* J2534 app, and for using the Pi as a universal shop adapter.

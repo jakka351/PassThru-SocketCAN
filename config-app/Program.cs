@@ -78,8 +78,10 @@
 // Tester Present Specialist Automotive Solutions - https://github.com/jakka351/PassThru-SocketCAN
 using System;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Text;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -120,10 +122,52 @@ namespace TesSocketCANConfig
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(560, 470);
+            ClientSize = new Size(560, 570);
             Font = new Font("Segoe UI", 9f);
 
-            int y = 14;
+            // ---- header band: titles (left) + logo (top-right) ----
+            const int headerH = 74;
+            var header = new Panel { Dock = DockStyle.Top, Height = headerH, BackColor = Color.White };
+            header.Paint += (s, e) => e.Graphics.DrawLine(Pens.Silver, 0, headerH - 1, header.Width, headerH - 1);
+            header.Controls.Add(new Label
+            {
+                Text = "Tester Present Specialist Automotive Solutions",
+                Font = new Font("Segoe UI", 13f, FontStyle.Bold), ForeColor = Color.FromArgb(20, 20, 20),
+                AutoSize = false, Left = 14, Top = 12, Width = 400, Height = 28
+            });
+            header.Controls.Add(new Label
+            {
+                Text = "SocketCAN PassThru Config Application",
+                Font = new Font("Segoe UI", 9.75f), ForeColor = Color.FromArgb(90, 90, 90),
+                AutoSize = false, Left = 16, Top = 43, Width = 400, Height = 20
+            });
+            var logo = LoadLogo();
+            if (logo != null)
+            {
+                header.Controls.Add(new PictureBox
+                {
+                    Image = logo, SizeMode = PictureBoxSizeMode.Zoom, BackColor = Color.White,
+                    Width = 150, Height = 60, Top = 7, Left = ClientSize.Width - 150 - 12,
+                    Anchor = AnchorStyles.Top | AnchorStyles.Right
+                });
+            }
+            Controls.Add(header);
+
+            // ---- status bar: a programmatically drawn Australian flag ----
+            var status = new StatusStrip { SizingGrip = false };
+            status.Items.Add(new ToolStripStatusLabel
+            {
+                Image = CreateAustralianFlag(40, 20), Text = " Made in Australia",
+                ImageAlign = ContentAlignment.MiddleLeft, TextAlign = ContentAlignment.MiddleLeft
+            });
+            status.Items.Add(new ToolStripStatusLabel
+            {
+                Spring = true, TextAlign = ContentAlignment.MiddleRight,
+                Text = "github.com/jakka351/PassThru-SocketCAN"
+            });
+            Controls.Add(status);
+
+            int y = headerH + 14;
             AddLabel("Raspberry Pi host / IP:", 16, y);
             _host.SetBounds(220, y - 3, 320, 24); Controls.Add(_host);
             y += 34;
@@ -161,7 +205,7 @@ namespace TesSocketCANConfig
             bUnreg.Click += (s, e) => UnregisterDevice();
             y += 40;
 
-            _log.SetBounds(16, y, 524, 470 - y - 14);
+            _log.SetBounds(16, y, 524, ClientSize.Height - 30 - y - 10);   // fill down to just above the status bar
             _log.Multiline = true; _log.ReadOnly = true; _log.ScrollBars = ScrollBars.Vertical;
             _log.BackColor = SystemColors.Window; _log.Font = new Font("Consolas", 8.5f);
             Controls.Add(_log);
@@ -381,5 +425,90 @@ namespace TesSocketCANConfig
         }
 
         private void Warn(string s) { LogLine("  " + s); MessageBox.Show(this, s, "Tester Present SocketCAN", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+
+        // ---- branding helpers -----------------------------------------------------------
+        private static Image LoadLogo()
+        {
+            try
+            {
+                var asm = Assembly.GetExecutingAssembly();
+                foreach (var n in asm.GetManifestResourceNames())
+                {
+                    if (!n.EndsWith("logo.png", StringComparison.OrdinalIgnoreCase)) continue;
+                    using (var s = asm.GetManifestResourceStream(n))
+                    {
+                        if (s == null) return null;
+                        // Image.FromStream keeps a reference to the stream for lazy decoding, so copy
+                        // the resource into a MemoryStream that lives for the Image's lifetime — do NOT
+                        // dispose the source's stream out from under it (that leaves a blank image).
+                        var ms = new MemoryStream();
+                        s.CopyTo(ms);
+                        ms.Position = 0;
+                        return Image.FromStream(ms);
+                    }
+                }
+            }
+            catch { }
+            return null;   // logo is optional — the app runs fine without it
+        }
+
+        /// <summary>
+        /// Draws a small Australian flag entirely in GDI+ (no image asset): navy field, a Union Jack
+        /// canton, the Commonwealth (Federation) star at the lower hoist, and the Southern Cross on the fly.
+        /// </summary>
+        private static Bitmap CreateAustralianFlag(int w, int h)
+        {
+            var bmp = new Bitmap(w, h);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                using (var navy = new SolidBrush(Color.FromArgb(0, 33, 105))) g.FillRectangle(navy, 0, 0, w, h);
+
+                DrawUnionJack(g, 0, 0, w / 2f, h / 2f);                                   // top-left quarter
+
+                Brush white = Brushes.White;
+                FillStar(g, white, w * 0.25f, h * 0.75f, h * 0.17f,  h * 0.075f, 7);      // Commonwealth star
+                FillStar(g, white, w * 0.74f, h * 0.24f, h * 0.11f,  h * 0.050f, 7);      // Gamma Crucis
+                FillStar(g, white, w * 0.60f, h * 0.50f, h * 0.11f,  h * 0.050f, 7);      // Beta  Crucis
+                FillStar(g, white, w * 0.74f, h * 0.80f, h * 0.12f,  h * 0.055f, 7);      // Alpha Crucis
+                FillStar(g, white, w * 0.88f, h * 0.49f, h * 0.10f,  h * 0.045f, 7);      // Delta Crucis
+                FillStar(g, white, w * 0.80f, h * 0.60f, h * 0.060f, h * 0.028f, 5);      // Epsilon Crucis (small)
+            }
+            return bmp;
+        }
+
+        private static void DrawUnionJack(Graphics g, float x, float y, float w, float h)
+        {
+            g.SetClip(new RectangleF(x, y, w, h));
+            using (var navy = new SolidBrush(Color.FromArgb(0, 33, 105))) g.FillRectangle(navy, x, y, w, h);
+            float cx = x + w / 2f, cy = y + h / 2f;
+            using (var wSalt  = new Pen(Color.White, h * 0.22f))
+            using (var rSalt  = new Pen(Color.FromArgb(200, 16, 46), h * 0.10f))
+            using (var wCross = new Pen(Color.White, h * 0.30f))
+            using (var rCross = new Pen(Color.FromArgb(200, 16, 46), h * 0.18f))
+            {
+                g.DrawLine(wSalt, x, y, x + w, y + h);          // St Andrew (white saltire)
+                g.DrawLine(wSalt, x + w, y, x, y + h);
+                g.DrawLine(rSalt, x, y, x + w, y + h);          // St Patrick (red saltire)
+                g.DrawLine(rSalt, x + w, y, x, y + h);
+                g.DrawLine(wCross, cx, y, cx, y + h);           // white cross
+                g.DrawLine(wCross, x, cy, x + w, cy);
+                g.DrawLine(rCross, cx, y, cx, y + h);           // St George (red cross)
+                g.DrawLine(rCross, x, cy, x + w, cy);
+            }
+            g.ResetClip();
+        }
+
+        private static void FillStar(Graphics g, Brush b, float cx, float cy, float rOut, float rIn, int pts)
+        {
+            var p = new PointF[pts * 2];
+            for (int i = 0; i < pts * 2; i++)
+            {
+                double ang = -Math.PI / 2 + i * Math.PI / pts;
+                float r = (i % 2 == 0) ? rOut : rIn;
+                p[i] = new PointF(cx + (float)(r * Math.Cos(ang)), cy + (float)(r * Math.Sin(ang)));
+            }
+            g.FillPolygon(b, p);
+        }
     }
 }
