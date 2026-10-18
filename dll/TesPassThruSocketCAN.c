@@ -217,6 +217,7 @@ typedef struct {
     uint16_t total;      /* expected total length from FF */
     uint16_t have;       /* bytes accumulated */
     uint8_t  next_sn;    /* expected sequence number */
+    uint32_t last_ms;    /* GetTickCount at last FF/CF — for N_Cr stale-slot reclaim */
     uint8_t  buf[MAX_MSG_DATA];
 } isotp_rx_t;
 
@@ -228,11 +229,19 @@ typedef struct {
     int           loopback;
     int           pad;           /* ISO15765 frame padding on */
     filter_t      filters[MAX_FILTERS];
-    isotp_rx_t    reasm[MAX_FILTERS];
+    isotp_rx_t    reasm[MAX_FILTERS];   /* touched ONLY by the RX thread -> no lock needed */
     /* rx message queue (completed PASSTHRU_MSGs ready for the app) */
     PASSTHRU_MSG  rxq[RX_QUEUE_LEN];
     int           rq_head, rq_tail, rq_count;
-    CRITICAL_SECTION rq_lock;
+    CRITICAL_SECTION rq_lock;           /* guards rxq + rq_* */
+    CRITICAL_SECTION filt_lock;         /* guards filters[] (RX thread vs app Start/Stop/Clear) — leaf lock */
+    CRITICAL_SECTION iso_tx_lock;       /* serialises one ISO-TP transmit sequence per channel */
+    /* per-channel ISO-TP flow-control capture (set by RX thread, read by this channel's TX) */
+    HANDLE            fc_event;
+    volatile uint32_t fc_from_id;       /* source id the captured FC arrived on */
+    volatile uint8_t  fc_fs;            /* 0=CTS 1=WAIT 2=OVFLW */
+    volatile uint8_t  fc_bs;
+    volatile uint8_t  fc_stmin;
 } channel_t;
 
 static channel_t  g_chan[MAX_CHANNELS];
@@ -240,17 +249,9 @@ static int        g_device_open = 0;
 static SOCKET     g_sock = INVALID_SOCKET;
 static HANDLE     g_rx_thread = NULL;
 static volatile LONG g_rx_run = 0;
-static CRITICAL_SECTION g_tx_lock;
+static CRITICAL_SECTION g_tx_lock;      /* serialises raw writes to the one socketcand socket */
 static int        g_cs_init = 0;
 static char       g_last_error[80] = "No error";
-
-/* ISO-TP flow-control capture (set by the RX thread, read by the TX path).
- * Global, so one ISO15765 multi-frame transmit at a time (v1 assumption). */
-static HANDLE          g_fc_event = NULL;
-static volatile uint32_t g_fc_id = 0;
-static volatile uint8_t  g_fc_fs = 0;   /* 0=CTS 1=WAIT 2=OVFLW */
-static volatile uint8_t  g_fc_bs = 0;
-static volatile uint8_t  g_fc_stmin = 0;
 
 /* config (from registry) */
 static char       g_host[128] = "10.42.0.1";
@@ -271,11 +272,19 @@ static void load_config(void)
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
             "SOFTWARE\\Tester Present\\PassThru-SocketCAN", 0, KEY_READ, &k) == ERROR_SUCCESS) {
         DWORD sz, type, dw;
-        sz = sizeof(g_host);   RegQueryValueExA(k, "Host",      NULL, &type, (LPBYTE)g_host,  &sz);
-        sz = sizeof(g_iface);  RegQueryValueExA(k, "Interface", NULL, &type, (LPBYTE)g_iface, &sz);
-        sz = sizeof(dw); if (RegQueryValueExA(k, "Port",      NULL, &type, (LPBYTE)&dw, &sz) == ERROR_SUCCESS && dw) g_port = (int)dw;
-        sz = sizeof(dw); if (RegQueryValueExA(k, "Bitrate",   NULL, &type, (LPBYTE)&dw, &sz) == ERROR_SUCCESS && dw) g_bitrate = dw;
-        sz = sizeof(dw); if (RegQueryValueExA(k, "ListenOnly",NULL, &type, (LPBYTE)&dw, &sz) == ERROR_SUCCESS)       g_listen_only = (int)dw;
+        /* RegQueryValueExA does not guarantee a NUL terminator; force one and ignore
+         * wrong-typed values rather than trusting a mistyped/short REG_SZ. */
+        type = 0; sz = sizeof(g_host);
+        if (RegQueryValueExA(k, "Host", NULL, &type, (LPBYTE)g_host, &sz) == ERROR_SUCCESS && type == REG_SZ)
+            g_host[(sz < sizeof(g_host)) ? sz : sizeof(g_host)-1] = 0;
+        g_host[sizeof(g_host)-1] = 0;
+        type = 0; sz = sizeof(g_iface);
+        if (RegQueryValueExA(k, "Interface", NULL, &type, (LPBYTE)g_iface, &sz) == ERROR_SUCCESS && type == REG_SZ)
+            g_iface[(sz < sizeof(g_iface)) ? sz : sizeof(g_iface)-1] = 0;
+        g_iface[sizeof(g_iface)-1] = 0;
+        sz = sizeof(dw); if (RegQueryValueExA(k, "Port",      NULL, &type, (LPBYTE)&dw, &sz) == ERROR_SUCCESS && type == REG_DWORD && dw) g_port = (int)dw;
+        sz = sizeof(dw); if (RegQueryValueExA(k, "Bitrate",   NULL, &type, (LPBYTE)&dw, &sz) == ERROR_SUCCESS && type == REG_DWORD && dw) g_bitrate = dw;
+        sz = sizeof(dw); if (RegQueryValueExA(k, "ListenOnly",NULL, &type, (LPBYTE)&dw, &sz) == ERROR_SUCCESS && type == REG_DWORD)       g_listen_only = (int)dw;
         RegCloseKey(k);
     }
 }
@@ -318,12 +327,24 @@ static int sc_read_msg(char *out, int cap, int timeout_ms)
     return 1;
 }
 
+/* socketcand's success reply to open/rawmode is exactly "< ok >". A substring test on
+ * "ok" also matches error replies that happen to contain those letters, so compare the
+ * trimmed payload as a whole token. */
+static int reply_is_ok(const char *s)
+{
+    while (*s == ' ') s++;
+    if (s[0] != 'o' || s[1] != 'k') return 0;
+    s += 2;
+    while (*s == ' ') s++;
+    return *s == 0;
+}
+
 static int sc_command(const char *cmd, int timeout_ms)
 {
     char reply[LINE_BUF];
     if (!sc_write(cmd)) return 0;
     if (!sc_read_msg(reply, sizeof(reply), timeout_ms)) return 0;
-    return strstr(reply, "ok") != NULL;
+    return reply_is_ok(reply);
 }
 
 static int sc_connect(void)
@@ -371,8 +392,9 @@ static int sc_connect(void)
 static int sc_send_frame(const canframe_t *f)
 {
     char line[128]; int p = 0; int i;
+    uint32_t id = f->id & (f->ext ? 0x1FFFFFFFu : 0x7FFu);
     if (g_listen_only) return 0;
-    p += sprintf(line + p, "< send %0*X %u", f->ext ? 8 : 3, f->id, (unsigned)f->dlc);
+    p += sprintf(line + p, "< send %0*X %u", f->ext ? 8 : 3, id, (unsigned)f->dlc);
     for (i = 0; i < f->dlc && i < 8; i++) p += sprintf(line + p, " %02X", f->data[i]);
     p += sprintf(line + p, " >");
     return sc_write(line);
@@ -402,6 +424,7 @@ static int sc_parse_frame(const char *msg, canframe_t *f)
     memset(f, 0, sizeof(*f));
     f->id  = (uint32_t)strtoul(idbuf, NULL, 16);
     f->ext = (strlen(idbuf) > 3 || f->id > 0x7FF) ? 1 : 0;
+    f->id &= f->ext ? 0x1FFFFFFFu : 0x7FFu;
 
     {                                                        /* remainder: hex data */
         int n = 0;
@@ -456,7 +479,7 @@ static void make_msg(PASSTHRU_MSG *m, uint32_t protocol, uint32_t rxstatus,
     memset(m, 0, sizeof(*m));
     m->ProtocolID = protocol;
     m->RxStatus   = rxstatus | (ext ? CAN_29BIT_ID : 0);
-    m->Timestamp  = GetTickCount() * 1000;
+    m->Timestamp  = (uint32_t)(GetTickCount64() * 1000ULL);  /* 32-bit us field; GetTickCount()*1000 overflowed at ~71min uptime */
     m->Data[0] = (uint8_t)(id >> 24); m->Data[1] = (uint8_t)(id >> 16);
     m->Data[2] = (uint8_t)(id >> 8);  m->Data[3] = (uint8_t)id;
     if (plen > MAX_MSG_DATA - 4) plen = MAX_MSG_DATA - 4;
@@ -467,18 +490,33 @@ static void make_msg(PASSTHRU_MSG *m, uint32_t protocol, uint32_t rxstatus,
 /* ===========================================================================
  *  Filtering + ISO-TP reception
  * ========================================================================= */
-static filter_t *match_filter(channel_t *ch, const canframe_t *f)
+/* Returns 1 and copies the matched (non-block) filter into *out, else 0. The copy is taken
+ * under filt_lock so the RX thread never races the app's Start/Stop/Clear filter calls, and
+ * the caller holds no lock afterwards (filt_lock is a leaf — never nested with tx/rq locks). */
+static int match_filter(channel_t *ch, const canframe_t *f, filter_t *out)
 {
-    int i;
+    int i, matched = 0;
+    EnterCriticalSection(&ch->filt_lock);
     for (i = 0; i < MAX_FILTERS; i++) {
         filter_t *fl = &ch->filters[i];
         if (!fl->used) continue;
         if ((f->id & fl->mask_id) == (fl->patt_id & fl->mask_id)) {
-            if (fl->type == BLOCK_FILTER) return NULL;
-            return fl;
+            if (fl->type == BLOCK_FILTER) { matched = 0; break; }  /* explicitly blocked */
+            *out = *fl; matched = 1; break;
         }
     }
-    return NULL;
+    LeaveCriticalSection(&ch->filt_lock);
+    return matched;
+}
+
+/* 1 if the channel has any filter installed (RX gate for raw CAN). */
+static int any_filter(channel_t *ch)
+{
+    int k, any = 0;
+    EnterCriticalSection(&ch->filt_lock);
+    for (k = 0; k < MAX_FILTERS; k++) if (ch->filters[k].used) { any = 1; break; }
+    LeaveCriticalSection(&ch->filt_lock);
+    return any;
 }
 
 /* Send an ISO-TP flow-control frame (CTS, BS=0, STmin=0) on fc_id */
@@ -494,43 +532,50 @@ static void send_fc(const filter_t *fl)
 /* Feed one received CAN frame into a channel (post-filter) */
 static void channel_rx(channel_t *ch, const canframe_t *f)
 {
-    filter_t *fl;
+    filter_t fl;
     PASSTHRU_MSG m;
 
     if (ch->protocol == CAN) {
-        /* Raw CAN: must pass a filter (J2534 requires at least one PASS filter) */
-        if (match_filter(ch, f) == NULL && ch->filters[0].used) return;
+        /* Raw CAN: once ANY filter is installed, a frame must pass one. (Keying only on
+         * filters[0].used leaked everything when the app's filter landed in a later slot.) */
+        if (!match_filter(ch, f, &fl) && any_filter(ch)) return;
         make_msg(&m, CAN, 0, f->id, f->ext, f->data, f->dlc);
         rq_push(ch, &m);
         return;
     }
 
     /* ISO15765 */
-    fl = match_filter(ch, f);
-    if (fl == NULL) return;                      /* not one of our flow-control conversations */
+    if (!match_filter(ch, f, &fl)) return;       /* not one of our flow-control conversations */
     if (f->dlc < 1) return;
 
     {
         uint8_t pci = f->data[0] >> 4;
         if (pci == 0x0) {                        /* Single Frame */
             uint8_t len = f->data[0] & 0x0F;
-            if (len > 7) len = 7;
+            if (len == 0 || len > 7 || (uint8_t)(len + 1) > f->dlc) return;  /* malformed SF */
             make_msg(&m, ISO15765, 0, f->id, f->ext, f->data + 1, len);
             rq_push(ch, &m);
         }
         else if (pci == 0x1) {                   /* First Frame */
             int i;
             isotp_rx_t *r = NULL;
+            uint32_t now = GetTickCount();
             uint16_t total = (uint16_t)(((f->data[0] & 0x0F) << 8) | f->data[1]);
-            for (i = 0; i < MAX_FILTERS; i++) { if (!ch->reasm[i].active) { r = &ch->reasm[i]; break; } }
+            if (total < 8) return;                           /* <8 => SF territory / escape form (unsupported v1) */
+            if (total > MAX_MSG_DATA) total = MAX_MSG_DATA;  /* clamp BEFORE storing so CF writes can't overrun buf */
+            /* reuse a slot already reassembling this id (duplicate / restarted FF) ... */
+            for (i = 0; i < MAX_FILTERS; i++) if (ch->reasm[i].active && ch->reasm[i].rx_id == f->id) { r = &ch->reasm[i]; break; }
+            /* ... else a free slot ... */
+            if (!r) for (i = 0; i < MAX_FILTERS; i++) if (!ch->reasm[i].active) { r = &ch->reasm[i]; break; }
+            /* ... else reclaim the stalest slot (N_Cr elapsed) so orphaned FFs can't wedge reassembly */
+            if (!r) for (i = 0; i < MAX_FILTERS; i++) if ((uint32_t)(now - ch->reasm[i].last_ms) > 1000u) { r = &ch->reasm[i]; break; }
             if (!r) return;
-            r->active = 1; r->rx_id = f->id; r->ext = f->ext; r->total = total; r->have = 0; r->next_sn = 1;
-            if (total > MAX_MSG_DATA) total = MAX_MSG_DATA;
-            { int c = f->dlc - 2; if (c > 0) { memcpy(r->buf, f->data + 2, c); r->have = (uint16_t)c; } }
+            r->active = 1; r->rx_id = f->id; r->ext = f->ext; r->total = total; r->have = 0; r->next_sn = 1; r->last_ms = now;
+            { int c = f->dlc - 2; if (c > (int)total) c = (int)total; if (c > 0) { memcpy(r->buf, f->data + 2, c); r->have = (uint16_t)c; } }
             /* J2534 first-frame indication: id only, START_OF_MESSAGE */
             make_msg(&m, ISO15765, START_OF_MESSAGE, f->id, f->ext, NULL, 0);
             rq_push(ch, &m);
-            send_fc(fl);                          /* we are the receiver -> grant flow control */
+            send_fc(&fl);                         /* we are the receiver -> grant flow control */
         }
         else if (pci == 0x2) {                   /* Consecutive Frame */
             int i; isotp_rx_t *r = NULL;
@@ -538,6 +583,7 @@ static void channel_rx(channel_t *ch, const canframe_t *f)
             if (!r) return;
             if ((f->data[0] & 0x0F) != r->next_sn) { r->active = 0; return; }  /* sequence gap -> abandon */
             r->next_sn = (uint8_t)((r->next_sn + 1) & 0x0F);
+            r->last_ms = GetTickCount();
             {
                 int c = f->dlc - 1;
                 int room = (int)r->total - (int)r->have;
@@ -550,12 +596,12 @@ static void channel_rx(channel_t *ch, const canframe_t *f)
                 r->active = 0;
             }
         }
-        else if (pci == 0x3) {                   /* Flow Control from the ECU (for our multi-frame TX) */
-            g_fc_id    = f->id;
-            g_fc_fs    = (uint8_t)(f->data[0] & 0x0F);
-            g_fc_bs    = f->dlc > 1 ? f->data[1] : 0;
-            g_fc_stmin = f->dlc > 2 ? f->data[2] : 0;
-            if (g_fc_event) SetEvent(g_fc_event);
+        else if (pci == 0x3) {                   /* Flow Control from the ECU (for this channel's multi-frame TX) */
+            ch->fc_from_id = f->id;
+            ch->fc_fs      = (uint8_t)(f->data[0] & 0x0F);
+            ch->fc_bs      = f->dlc > 1 ? f->data[1] : 0;
+            ch->fc_stmin   = f->dlc > 2 ? f->data[2] : 0;
+            if (ch->fc_event) SetEvent(ch->fc_event);
         }
     }
 }
@@ -587,35 +633,58 @@ static DWORD WINAPI rx_thread(LPVOID arg)
 static uint32_t iso15765_send(channel_t *ch, uint32_t id, int ext, const uint8_t *payload, uint32_t len)
 {
     canframe_t f;
-    uint32_t off;
+    uint32_t off = 0;
     uint8_t  sn = 1;
     int      padlen = ch->pad ? 1 : 0;
+    int      wft = 0;                                  /* consecutive no-progress FC counter (N_WFTmax) */
+    uint32_t exp_src = 0; int have_exp = 0; int i;
+    uint32_t rc;
+
+    /* FF_DL is 12 bits here (no escape form in v1). Reject oversize up front so the FF
+     * length never truncates and the CF loop can never read past the caller's Data[]. */
+    if (len > 4095) { set_err("ISO-TP message exceeds 4095 bytes (v1)"); return ERR_EXCEEDED_LIMIT; }
+
+    /* The ECU's flow control comes back on the response id. Derive it from the flow-control
+     * filter the app installed for this TX id (fc_id -> patt_id), so a stray FC from another
+     * conversation can't satisfy our wait. */
+    EnterCriticalSection(&ch->filt_lock);
+    for (i = 0; i < MAX_FILTERS; i++)
+        if (ch->filters[i].used && ch->filters[i].type == FLOW_CONTROL_FILTER && ch->filters[i].fc_id == id)
+            { exp_src = ch->filters[i].patt_id; have_exp = 1; break; }
+    LeaveCriticalSection(&ch->filt_lock);
+
+    /* Serialise the whole transmit sequence per channel so a second writer (or a raw SF)
+     * can't inject frames between our FF and CFs on the same bus. */
+    EnterCriticalSection(&ch->iso_tx_lock);
 
     if (len <= 7) {                                    /* Single Frame */
         memset(&f, 0, sizeof(f)); f.id = id; f.ext = ext;
         f.data[0] = (uint8_t)len;                      /* SF, length in low nibble */
         memcpy(f.data + 1, payload, len);
         f.dlc = padlen ? 8 : (uint8_t)(1 + len);
-        return sc_send_frame(&f) ? STATUS_NOERROR : ERR_FAILED;
+        rc = sc_send_frame(&f) ? STATUS_NOERROR : ERR_FAILED;
+        goto done;
     }
 
-    if (g_fc_event) ResetEvent(g_fc_event);            /* arm before the FF so a stale FC can't fire */
+    if (ch->fc_event) ResetEvent(ch->fc_event);        /* arm before the FF so a stale FC can't fire */
 
     memset(&f, 0, sizeof(f)); f.id = id; f.ext = ext;  /* First Frame */
     f.data[0] = (uint8_t)(0x10 | ((len >> 8) & 0x0F));
     f.data[1] = (uint8_t)(len & 0xFF);
     memcpy(f.data + 2, payload, 6);
     f.dlc = 8;
-    if (!sc_send_frame(&f)) return ERR_FAILED;
+    if (!sc_send_frame(&f)) { rc = ERR_FAILED; goto done; }
     off = 6;
 
     for (;;) {                                         /* one iteration per flow-control block */
         uint8_t bs, stmin; uint32_t in_block = 0;
-        if (!g_fc_event || WaitForSingleObject(g_fc_event, 1000) != WAIT_OBJECT_0) return ERR_TIMEOUT;
-        ResetEvent(g_fc_event);
-        if (g_fc_fs == 1) continue;                    /* WAIT  -> keep waiting for CTS */
-        if (g_fc_fs == 2) return ERR_FAILED;           /* OVFLW -> ECU can't receive */
-        bs = g_fc_bs; stmin = g_fc_stmin;              /* CTS */
+        if (!ch->fc_event || WaitForSingleObject(ch->fc_event, 1000) != WAIT_OBJECT_0) { rc = ERR_TIMEOUT; goto done; }
+        ResetEvent(ch->fc_event);
+        if (have_exp && ch->fc_from_id != exp_src) { if (++wft > 4) { rc = ERR_TIMEOUT; goto done; } continue; }  /* not our ECU */
+        if (ch->fc_fs == 1) { if (++wft > 4) { rc = ERR_TIMEOUT; goto done; } continue; }  /* WAIT -> bounded by N_WFTmax */
+        if (ch->fc_fs == 2) { rc = ERR_FAILED; goto done; }           /* OVFLW -> ECU can't receive */
+        wft = 0;
+        bs = ch->fc_bs; stmin = ch->fc_stmin;          /* CTS */
 
         while (off < len) {
             int c = (int)(len - off); if (c > 7) c = 7;
@@ -623,14 +692,22 @@ static uint32_t iso15765_send(channel_t *ch, uint32_t id, int ext, const uint8_t
             f.data[0] = (uint8_t)(0x20 | (sn & 0x0F));
             memcpy(f.data + 1, payload + off, c);
             f.dlc = padlen ? 8 : (uint8_t)(1 + c);
-            if (!sc_send_frame(&f)) return ERR_FAILED;
+            if (!sc_send_frame(&f)) { rc = ERR_FAILED; goto done; }
             off += c; sn = (uint8_t)((sn + 1) & 0x0F); in_block++;
-            if (stmin == 0 || stmin > 127) Sleep(1); else Sleep(stmin);
+            /* ISO 15765-2 STmin: 0x00..0x7F = ms; 0xF1..0xF9 = 100..900 us; else reserved -> max */
+            if      (stmin == 0)                      { /* no separation time */ }
+            else if (stmin <= 0x7F)                   Sleep(stmin);
+            else if (stmin >= 0xF1 && stmin <= 0xF9)  Sleep(1);
+            else                                      Sleep(127);
             if (bs != 0 && in_block >= bs && off < len) break;   /* block full -> await next FC */
         }
         if (off >= len) break;
     }
-    return STATUS_NOERROR;
+    rc = STATUS_NOERROR;
+
+done:
+    LeaveCriticalSection(&ch->iso_tx_lock);
+    return rc;
 }
 
 /* ===========================================================================
@@ -641,9 +718,32 @@ static void ensure_cs(void)
     if (!g_cs_init) {
         int i;
         InitializeCriticalSection(&g_tx_lock);
-        for (i = 0; i < MAX_CHANNELS; i++) InitializeCriticalSection(&g_chan[i].rq_lock);
+        for (i = 0; i < MAX_CHANNELS; i++) {
+            InitializeCriticalSection(&g_chan[i].rq_lock);
+            InitializeCriticalSection(&g_chan[i].filt_lock);
+            InitializeCriticalSection(&g_chan[i].iso_tx_lock);
+            g_chan[i].fc_event = CreateEventA(NULL, TRUE /*manual-reset*/, FALSE, NULL);
+        }
         g_cs_init = 1;
     }
+}
+
+/* Zero a channel's data members WITHOUT touching rq_lock. rq_lock is initialised once in
+ * ensure_cs() and must survive open/close — memset-ing over a live CRITICAL_SECTION
+ * corrupts it, and the next EnterCriticalSection then deadlocks the RX path on first use. */
+static void reset_channel(channel_t *ch)
+{
+    /* Called only with the RX thread stopped (open before thread start, close after join),
+     * so no live reader races these writes. */
+    EnterCriticalSection(&ch->rq_lock);
+    ch->used = 0; ch->protocol = 0; ch->flags = 0; ch->baud = 0;
+    ch->loopback = 0; ch->pad = 0;
+    memset(ch->filters, 0, sizeof(ch->filters));
+    memset(ch->reasm,   0, sizeof(ch->reasm));
+    ch->rq_head = ch->rq_tail = ch->rq_count = 0;
+    ch->fc_from_id = 0; ch->fc_fs = 0; ch->fc_bs = 0; ch->fc_stmin = 0;
+    if (ch->fc_event) ResetEvent(ch->fc_event);
+    LeaveCriticalSection(&ch->rq_lock);
 }
 
 static void teardown_transport(void)
@@ -659,15 +759,18 @@ static void teardown_transport(void)
 static int g_wsa = 0;
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r)
 {
-    (void)h; (void)r;
+    (void)r;
     if (reason == DLL_PROCESS_ATTACH) {
-        WSADATA wd; if (WSAStartup(MAKEWORD(2,2), &wd) == 0) g_wsa = 1;
-        g_fc_event = CreateEventA(NULL, TRUE /*manual-reset*/, FALSE, NULL);
-        ensure_cs();
+        /* Loader-lock-safe work only. WSAStartup loads provider DLLs and must NOT run
+         * here; it is started lazily in PassThruOpen. CreateEvent + InitializeCriticalSection
+         * are kernel32 and documented-safe in DllMain. */
+        DisableThreadLibraryCalls(h);
+        ensure_cs();   /* creates per-channel locks + flow-control events */
     } else if (reason == DLL_PROCESS_DETACH) {
-        teardown_transport();
-        if (g_fc_event) { CloseHandle(g_fc_event); g_fc_event = NULL; }
-        if (g_wsa) { WSACleanup(); g_wsa = 0; }
+        /* Never join the RX thread or call WSACleanup under the loader lock — both can
+         * deadlock. Only signal the thread to stop; PassThruClose does the real teardown,
+         * and the OS reclaims the socket/thread/Winsock at process exit. */
+        InterlockedExchange(&g_rx_run, 0);
     }
     return TRUE;
 }
@@ -677,17 +780,21 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r)
  * ========================================================================= */
 __declspec(dllexport) long __stdcall PassThruOpen(void *pName, unsigned long *pDeviceID)
 {
+    int i;
     (void)pName;
     if (!pDeviceID) return ERR_NULL_PARAMETER;
     ensure_cs();
     if (g_device_open) return ERR_DEVICE_IN_USE;
 
     load_config();
-    if (!g_wsa) { set_err("Winsock not initialised"); return ERR_FAILED; }
+    if (!g_wsa) {                                   /* lazy Winsock init (moved out of DllMain) */
+        WSADATA wd;
+        if (WSAStartup(MAKEWORD(2,2), &wd) != 0) { set_err("WSAStartup failed"); return ERR_FAILED; }
+        g_wsa = 1;
+    }
     if (!sc_connect()) return ERR_DEVICE_NOT_CONNECTED;
 
-    memset(g_chan, 0, sizeof(g_chan));
-    { int i; for (i = 0; i < MAX_CHANNELS; i++) { if (!g_cs_init) InitializeCriticalSection(&g_chan[i].rq_lock); } }
+    for (i = 0; i < MAX_CHANNELS; i++) reset_channel(&g_chan[i]);
 
     InterlockedExchange(&g_rx_run, 1);
     g_rx_thread = CreateThread(NULL, 0, rx_thread, NULL, 0, NULL);
@@ -701,10 +808,11 @@ __declspec(dllexport) long __stdcall PassThruOpen(void *pName, unsigned long *pD
 
 __declspec(dllexport) long __stdcall PassThruClose(unsigned long DeviceID)
 {
+    int i;
     (void)DeviceID;
     if (!g_device_open) return ERR_INVALID_DEVICE_ID;
     teardown_transport();
-    memset(g_chan, 0, sizeof(g_chan));
+    for (i = 0; i < MAX_CHANNELS; i++) reset_channel(&g_chan[i]);
     g_device_open = 0;
     return STATUS_NOERROR;
 }
@@ -732,6 +840,8 @@ __declspec(dllexport) long __stdcall PassThruConnect(
         ch->baud = BaudRate ? BaudRate : g_bitrate;
         ch->loopback = 0;
         ch->pad = (Flags & ISO15765_FRAME_PAD) ? 1 : 0;
+        /* publish used last so the RX thread never sees a half-initialised channel */
+        MemoryBarrier();
         ch->used = 1;
     }
     *pChannelID = (unsigned long)(i + 1);     /* 1-based channel id */
@@ -793,7 +903,7 @@ __declspec(dllexport) long __stdcall PassThruWriteMsgs(
     for (i = 0; i < n; i++) {
         PASSTHRU_MSG *m = &in[i];
         uint32_t id; int ext; uint32_t plen;
-        if (m->DataSize < 4) { continue; }
+        if (m->DataSize < 4 || m->DataSize > MAX_MSG_DATA) { continue; }  /* malformed / would read past Data[] */
         id = ((uint32_t)m->Data[0] << 24) | ((uint32_t)m->Data[1] << 16) |
              ((uint32_t)m->Data[2] << 8)  |  (uint32_t)m->Data[3];
         ext = (m->TxFlags & CAN_29BIT_ID) ? 1 : (id > 0x7FF);
@@ -824,27 +934,39 @@ __declspec(dllexport) long __stdcall PassThruStartMsgFilter(
     int i;
     if (!ch) return ERR_INVALID_CHANNEL_ID;
     if (!mask || !patt || !pFilterID) return ERR_NULL_PARAMETER;
+    if (FilterType != PASS_FILTER && FilterType != BLOCK_FILTER && FilterType != FLOW_CONTROL_FILTER)
+        return ERR_NOT_SUPPORTED;
     if (FilterType == FLOW_CONTROL_FILTER && !fc) return ERR_NULL_PARAMETER;
 
+    EnterCriticalSection(&ch->filt_lock);
     for (i = 0; i < MAX_FILTERS; i++) if (!ch->filters[i].used) break;
-    if (i == MAX_FILTERS) return ERR_EXCEEDED_LIMIT;
+    if (i == MAX_FILTERS) { LeaveCriticalSection(&ch->filt_lock); return ERR_EXCEEDED_LIMIT; }
 
     {
         filter_t *fl = &ch->filters[i];
-        memset(fl, 0, sizeof(*fl));
-        fl->used = 1; fl->type = FilterType;
+        filter_t nf;
+        memset(&nf, 0, sizeof(nf));
+        nf.type = FilterType;
         if (mask->DataSize >= 4)
-            fl->mask_id = ((uint32_t)mask->Data[0]<<24)|((uint32_t)mask->Data[1]<<16)|((uint32_t)mask->Data[2]<<8)|mask->Data[3];
+            nf.mask_id = ((uint32_t)mask->Data[0]<<24)|((uint32_t)mask->Data[1]<<16)|((uint32_t)mask->Data[2]<<8)|mask->Data[3];
         if (patt->DataSize >= 4)
-            fl->patt_id = ((uint32_t)patt->Data[0]<<24)|((uint32_t)patt->Data[1]<<16)|((uint32_t)patt->Data[2]<<8)|patt->Data[3];
+            nf.patt_id = ((uint32_t)patt->Data[0]<<24)|((uint32_t)patt->Data[1]<<16)|((uint32_t)patt->Data[2]<<8)|patt->Data[3];
         if (FilterType == FLOW_CONTROL_FILTER && fc->DataSize >= 4) {
-            fl->fc_id = ((uint32_t)fc->Data[0]<<24)|((uint32_t)fc->Data[1]<<16)|((uint32_t)fc->Data[2]<<8)|fc->Data[3];
-            fl->fc_ext = (fc->TxFlags & CAN_29BIT_ID) ? 1 : (fl->fc_id > 0x7FF);
+            nf.fc_id = ((uint32_t)fc->Data[0]<<24)|((uint32_t)fc->Data[1]<<16)|((uint32_t)fc->Data[2]<<8)|fc->Data[3];
+            nf.fc_ext = (fc->TxFlags & CAN_29BIT_ID) ? 1 : (nf.fc_id > 0x7FF);
         }
         /* a zero mask means "match everything" is NOT intended for FC; default full mask if app sent 0 for FC */
-        if (fl->mask_id == 0 && FilterType == FLOW_CONTROL_FILTER)
-            fl->mask_id = fl->patt_id > 0x7FF ? 0x1FFFFFFF : 0x7FF;
+        if (nf.mask_id == 0 && FilterType == FLOW_CONTROL_FILTER)
+            nf.mask_id = nf.patt_id > 0x7FF ? 0x1FFFFFFF : 0x7FF;
+        /* Publish the fully-built filter BEFORE marking the slot used. The RX thread reads
+         * filters[] unlocked; it must never observe used=1 with mask_id=0 (which matches
+         * every frame) during the window between claiming the slot and filling it. */
+        nf.used = 0;
+        *fl = nf;
+        MemoryBarrier();
+        fl->used = 1;
     }
+    LeaveCriticalSection(&ch->filt_lock);
     *pFilterID = (unsigned long)(i + 1);
     return STATUS_NOERROR;
 }
@@ -854,7 +976,9 @@ __declspec(dllexport) long __stdcall PassThruStopMsgFilter(unsigned long Channel
     channel_t *ch = chan_from_id(ChannelID);
     if (!ch) return ERR_INVALID_CHANNEL_ID;
     if (FilterID < 1 || FilterID > MAX_FILTERS) return ERR_INVALID_MSG_ID;
+    EnterCriticalSection(&ch->filt_lock);
     ch->filters[FilterID-1].used = 0;
+    LeaveCriticalSection(&ch->filt_lock);
     return STATUS_NOERROR;
 }
 
@@ -919,7 +1043,7 @@ __declspec(dllexport) long __stdcall PassThruIoctl(
             return STATUS_NOERROR;
 
         case CLEAR_MSG_FILTERS:
-            if (ch) memset(ch->filters, 0, sizeof(ch->filters));
+            if (ch) { EnterCriticalSection(&ch->filt_lock); memset(ch->filters, 0, sizeof(ch->filters)); LeaveCriticalSection(&ch->filt_lock); }
             return STATUS_NOERROR;
 
         case SET_CONFIG: {

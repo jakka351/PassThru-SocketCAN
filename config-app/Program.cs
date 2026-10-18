@@ -246,6 +246,14 @@ namespace TesSocketCANConfig
         private static RegistryKey HklmBase() =>
             RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry32);
 
+        private static string AsString(object v, string dflt) => (v is string s && s.Length > 0) ? s : dflt;
+        private static int AsInt(object v, int dflt)
+        {
+            if (v is int i) return i;
+            if (v is string s && int.TryParse(s, out int p)) return p;
+            return dflt;
+        }
+
         // ---- config load/save ----------------------------------------------------------
         private void LoadConfig()
         {
@@ -258,17 +266,19 @@ namespace TesSocketCANConfig
                 {
                     if (k != null)
                     {
-                        host  = (string)(k.GetValue("Host") ?? host);
-                        iface = (string)(k.GetValue("Interface") ?? iface);
-                        port  = (int)(k.GetValue("Port") ?? port);
-                        baud  = (uint)(int)(k.GetValue("Bitrate") ?? (int)baud);
-                        listen = (int)(k.GetValue("ListenOnly") ?? 0);
+                        // Read each value independently and type-safely: one mistyped value must
+                        // not throw and wipe every other field back to its default.
+                        host  = AsString(k.GetValue("Host"), host);
+                        iface = AsString(k.GetValue("Interface"), iface);
+                        port  = AsInt(k.GetValue("Port"), port);
+                        baud  = (uint)AsInt(k.GetValue("Bitrate"), (int)baud);
+                        listen = AsInt(k.GetValue("ListenOnly"), 0);
                     }
                 }
                 using (var b = HklmBase())
                 using (var k = b.OpenSubKey(J2534Key))
                 {
-                    if (k != null) dll = (string)(k.GetValue("FunctionLibrary") ?? dll);
+                    if (k != null) dll = AsString(k.GetValue("FunctionLibrary"), dll);
                 }
             }
             catch { /* first run — defaults */ }
@@ -280,14 +290,20 @@ namespace TesSocketCANConfig
 
         private string DefaultDllPath()
         {
-            // Prefer a DLL sitting next to this exe; else the sibling dll\ build output.
+            // Prefer a DLL sitting next to this exe; else walk up to the sibling dll\ build output.
             string exeDir = AppDomain.CurrentDomain.BaseDirectory;
             string local = Path.Combine(exeDir, "TesPassThruSocketCAN.dll");
             if (File.Exists(local)) return local;
             try
             {
-                string guess = Path.GetFullPath(Path.Combine(exeDir, @"..\..\..\dll\TesPassThruSocketCAN.dll"));
-                if (File.Exists(guess)) return guess;
+                // The exe lives under bin\<Config>\<tfm>\; the dll\ folder is a repo-root sibling.
+                // Search upward instead of a fixed ..\..\..\ so it works at any nesting depth.
+                var dir = new DirectoryInfo(exeDir);
+                for (int up = 0; up < 6 && dir != null; up++, dir = dir.Parent)
+                {
+                    string guess = Path.Combine(dir.FullName, "dll", "TesPassThruSocketCAN.dll");
+                    if (File.Exists(guess)) return guess;
+                }
             }
             catch { }
             return local;
@@ -295,7 +311,7 @@ namespace TesSocketCANConfig
 
         private bool SaveConfig()
         {
-            if (!int.TryParse(_port.Text.Trim(), out int port) || port <= 0) { Warn("Port must be a positive number."); return false; }
+            if (!int.TryParse(_port.Text.Trim(), out int port) || port < 1 || port > 65535) { Warn("Port must be between 1 and 65535."); return false; }
             if (string.IsNullOrWhiteSpace(_host.Text)) { Warn("Enter the Pi host / IP."); return false; }
             if (string.IsNullOrWhiteSpace(_iface.Text)) { Warn("Enter the SocketCAN interface (e.g. can0)."); return false; }
             try
@@ -363,7 +379,7 @@ namespace TesSocketCANConfig
         // ---- socketcand connection test -------------------------------------------------
         private void TestConnection()
         {
-            if (!int.TryParse(_port.Text.Trim(), out int port) || port <= 0) { Warn("Port must be a positive number."); return; }
+            if (!int.TryParse(_port.Text.Trim(), out int port) || port < 1 || port > 65535) { Warn("Port must be between 1 and 65535."); return; }
             string host = _host.Text.Trim(), iface = _iface.Text.Trim();
             LogLine(string.Format("Testing socketcand at {0}:{1}, interface {2} ...", host, port, iface));
             try
@@ -394,7 +410,9 @@ namespace TesSocketCANConfig
             byte[] b = Encoding.ASCII.GetBytes(cmd);
             ns.Write(b, 0, b.Length); ns.Flush();
             string reply = ReadMsg(ns);
-            return reply != null && reply.IndexOf("ok", StringComparison.OrdinalIgnoreCase) >= 0;
+            // socketcand replies "< ok >" on success; compare the trimmed payload as a whole
+            // token so an error reply that merely contains "ok" isn't mistaken for success.
+            return reply != null && reply.Trim().Equals("ok", StringComparison.OrdinalIgnoreCase);
         }
 
         private static string ReadMsg(NetworkStream ns)
